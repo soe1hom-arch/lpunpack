@@ -21,11 +21,22 @@ func NewExtractor(input, output string) *Extractor {
 }
 
 func (e *Extractor) Extract() error {
-	super, err := OpenSuperImage(e.Input)
+	super, err := OpenSuperImage(e.Input, e.Verbose)
 	if err != nil {
 		return fmt.Errorf("failed to open super image: %w", err)
 	}
 	defer super.Close()
+
+	super.Verbose = e.Verbose
+
+	// Need to re-parse with Verbose set
+	// Actually, Verbose is set after Open, and parse() already ran in Open.
+	// Let me re-parse if verbose is needed.
+	if e.Verbose {
+		// Re-parse is not possible since parse sets Partitions.
+		// Verbose output during parse won't happen.
+	}
+	_ = super.Verbose
 
 	if e.Verbose {
 		fmt.Printf("Super Image: %s (%s)\n", e.Input, formatSize(super.FileSize))
