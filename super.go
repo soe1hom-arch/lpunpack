@@ -4,30 +4,26 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 )
 
-// Constants from AOSP liblp metadata_format.h
 const (
-	LpMetadataGeometryMagic = 0x504D504C // "LPMP"
-	LpMetadataHeaderMagic  = 0x484D504C // "LPMH"
-
-	LpMetadataGeometrySize = 52
-	LpMetadataHeaderSize   = 24
-
+	LpMetadataGeometryMagic  = 0x504D504C
+	LpMetadataHeaderMagic    = 0x484D504C
+	LpMetadataGeometrySize   = 52
+	LpMetadataHeaderSize     = 24
 	LpMetadataExtentTypeLinear = 0
-
-	DefaultBlockSize = 4096
-	SectorSize       = 512
+	DefaultBlockSize         = 4096
+	SectorSize               = 512
+	MaxMetadataSize          = 16 * 1024 * 1024
+	MaxSlotCount             = 32
 )
 
-// LpMetadataGeometry from AOSP liblp (packed, 52 bytes)
 type LpMetadataGeometry struct {
-	Magic             [4]byte // "LPMP"
+	Magic             [4]byte
 	StructSize        uint32
 	Checksum          [32]byte
 	MetadataMaxSize   uint32
@@ -35,26 +31,15 @@ type LpMetadataGeometry struct {
 	LogicalBlockSize  uint32
 }
 
-// LpMetadataHeader from AOSP liblp (packed, 24 bytes)
 type LpMetadataHeader struct {
-	Magic         [4]byte // "LPMH"
-	MajorVersion  uint32 // 10
-	MinorVersion  uint32 // 0
+	Magic         [4]byte
+	MajorVersion  uint32
+	MinorVersion  uint32
 	HeaderSize    uint32
 	NumPartitions uint32
 	NumExtents    uint32
 }
 
-// LpMetadataPartition entry
-type LpMetadataPartition struct {
-	NameSize         uint32
-	Attributes       uint32
-	FirstExtentIndex uint32
-	NumExtents       uint32
-	Name             string
-}
-
-// LpMetadataExtent entry (32 bytes)
 type LpMetadataExtent struct {
 	NumSectors      uint64
 	Sector          uint64
@@ -62,281 +47,258 @@ type LpMetadataExtent struct {
 	Type            uint64
 }
 
-// PartitionInfo holds extracted partition info
 type PartitionInfo struct {
 	Name    string
 	Size    uint64
 	Extents []LpMetadataExtent
 }
 
-// SuperImage represents a parsed Android super image
 type SuperImage struct {
-	Filename   string
-	FileSize   int64
-	Geometry   LpMetadataGeometry
-	Partitions []PartitionInfo
-	file       *os.File
+	Filename       string
+	FileSize       int64
+	Geometry       LpMetadataGeometry
+	GeometryOffset int64
+	Partitions     []PartitionInfo
+	file           *os.File
 }
 
-// OpenSuperImage opens and parses a super image
 func OpenSuperImage(filename string) (*SuperImage, error) {
-	file, err := os.Open(filename)
+	f, err := os.Open(filename)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open file: %w", err)
+		return nil, fmt.Errorf("cannot open: %w", err)
 	}
-
-	fi, err := file.Stat()
+	fi, err := f.Stat()
 	if err != nil {
-		file.Close()
-		return nil, fmt.Errorf("cannot stat file: %w", err)
+		f.Close()
+		return nil, fmt.Errorf("cannot stat: %w", err)
 	}
-
-	sp := &SuperImage{
-		Filename: filename,
-		FileSize: fi.Size(),
-		file:     file,
-	}
-
+	sp := &SuperImage{Filename: filename, FileSize: fi.Size(), file: f}
 	if err := sp.parseMetadata(); err != nil {
-		file.Close()
+		f.Close()
 		return nil, err
 	}
-
 	return sp, nil
 }
 
+func (sp *SuperImage) Close() error { return sp.file.Close() }
+
 func (sp *SuperImage) parseMetadata() error {
-	geometry, err := sp.findGeometry()
+	geo, offset, err := sp.findGeometry()
 	if err != nil {
 		return fmt.Errorf("cannot find geometry: %w", err)
 	}
-	sp.Geometry = *geometry
+	sp.Geometry = *geo
+	sp.GeometryOffset = offset
 
-	blockSize := int64(sp.Geometry.LogicalBlockSize)
-	if blockSize == 0 {
-		blockSize = DefaultBlockSize
-	}
+	maxSize := int64(geo.MetadataMaxSize)
 
-	metadataMaxSize := int64(sp.Geometry.MetadataMaxSize)
-	if metadataMaxSize == 0 {
-		return fmt.Errorf("invalid metadata_max_size: 0")
-	}
-
-	// Geometry is stored at the last logical block
-	geometryOffset := alignDown(sp.FileSize, blockSize) - blockSize
-
-	// Metadata slot 0 is right before the geometry
-	slot0Offset := geometryOffset - metadataMaxSize
-	if slot0Offset < 0 {
-		return fmt.Errorf("metadata slot offset is negative (file too small)")
-	}
-
-	// Parse the metadata slot 0 (primary)
-	if err := sp.readMetadataSlot(slot0Offset); err != nil {
-		return fmt.Errorf("cannot read metadata slot: %w", err)
-	}
-
-	return nil
-}
-
-func (sp *SuperImage) findGeometry() (*LpMetadataGeometry, error) {
-	blockSize := int64(DefaultBlockSize)
-	candidates := []int64{
-		alignDown(sp.FileSize, blockSize) - blockSize,
-		sp.FileSize - int64(LpMetadataGeometrySize),
-		sp.FileSize - int64(4096),
-		sp.FileSize - int64(SectorSize)*2,
-		sp.FileSize - int64(SectorSize),
-	}
-
-	seen := make(map[int64]bool)
-	for _, offset := range candidates {
-		if offset < 0 || seen[offset] {
+	// Metadata slots are BEFORE the backup geometry (at the end of the image)
+	// Slot 0 is nearest to the geometry, slot N-1 furthest.
+	// per AOSP: slot N-1 is at geometry_offset - N * max_size
+	for slot := int32(0); slot < int32(geo.MetadataSlotCount); slot++ {
+		slotOffset := offset - int64(slot+1)*maxSize
+		if slotOffset < 0 {
 			continue
 		}
-		seen[offset] = true
+		var magic [4]byte
+		if _, err := sp.file.ReadAt(magic[:], slotOffset); err != nil {
+			continue
+		}
+		if string(magic[:]) != "LPMH" {
+			continue
+		}
+		if err := sp.readMetadataSlot(slotOffset); err == nil {
+			return nil
+		}
+	}
 
+	return fmt.Errorf("no valid metadata slot (LPMH) found")
+}
+
+func (sp *SuperImage) findGeometry() (*LpMetadataGeometry, int64, error) {
+	addCand := func(candidates *[]int64, off int64) {
+		if off >= 0 && off+LpMetadataGeometrySize <= sp.FileSize {
+			for _, c := range *candidates {
+				if c == off {
+					return
+				}
+			}
+			*candidates = append(*candidates, off)
+		}
+	}
+
+	var candidates []int64
+
+	// Known AOSP geometry locations:
+	addCand(&candidates, sp.FileSize-4096)     // last block
+	addCand(&candidates, sp.FileSize-1024)     // last 2 sectors
+	addCand(&candidates, sp.FileSize-512)      // last sector
+	addCand(&candidates, 0)                    // start of file
+	addCand(&candidates, 512)                  // sector 1
+	addCand(&candidates, 4096)                 // block 1
+
+	// Scan the last 128KB for LPMP (step=512 for speed)
+	scanStart := sp.FileSize - 128*1024
+	if scanStart < 0 {
+		scanStart = 0
+	}
+	sbuf := make([]byte, 4)
+	for off := scanStart; off < sp.FileSize-4; off += 512 {
+		if _, err := sp.file.ReadAt(sbuf, off); err != nil {
+			break
+		}
+		if sbuf[0] == 'L' && sbuf[1] == 'P' && sbuf[2] == 'M' && sbuf[3] == 'P' {
+			addCand(&candidates, off)
+		}
+	}
+
+	for _, offset := range candidates {
 		buf := make([]byte, LpMetadataGeometrySize)
 		n, err := sp.file.ReadAt(buf, offset)
 		if err != nil || n < LpMetadataGeometrySize {
 			continue
 		}
-
-		var geo LpMetadataGeometry
-		copy(geo.Magic[:], buf[0:4])
-		if string(geo.Magic[:]) != "LPMP" {
+		if string(buf[0:4]) != "LPMP" {
 			continue
 		}
 
+		geo := &LpMetadataGeometry{}
+		copy(geo.Magic[:], buf[0:4])
 		geo.StructSize = binary.LittleEndian.Uint32(buf[4:8])
 		copy(geo.Checksum[:], buf[8:40])
 		geo.MetadataMaxSize = binary.LittleEndian.Uint32(buf[40:44])
 		geo.MetadataSlotCount = binary.LittleEndian.Uint32(buf[44:48])
 		geo.LogicalBlockSize = binary.LittleEndian.Uint32(buf[48:52])
 
-		if geo.StructSize < 12 || geo.MetadataMaxSize == 0 {
+		// Sanity checks
+		if geo.StructSize < 12 || geo.StructSize > 4096 {
 			continue
 		}
-		if geo.LogicalBlockSize == 0 {
+		if geo.MetadataMaxSize < 512 || geo.MetadataMaxSize > MaxMetadataSize {
+			continue
+		}
+		if geo.MetadataSlotCount < 1 || geo.MetadataSlotCount > MaxSlotCount {
+			continue
+		}
+		if geo.LogicalBlockSize == 0 || geo.LogicalBlockSize > 65536 {
 			geo.LogicalBlockSize = DefaultBlockSize
 		}
 
-		// Verify SHA256 checksum
-		if !geo.verifyChecksum(buf) {
-			continue
-		}
-
-		return &geo, nil
+		return geo, offset, nil
 	}
 
-	return nil, fmt.Errorf("no valid LPMP geometry found in super image")
-}
-
-func (geo *LpMetadataGeometry) verifyChecksum(buf []byte) bool {
-	if geo.StructSize < 12 {
-		return false
-	}
-	// SHA256 of everything after the checksum field (offset 40 onwards)
-	hasher := sha256.New()
-	hasher.Write(buf[40:geo.StructSize])
-	sum := hasher.Sum(nil)
-	for i := 0; i < 32; i++ {
-		if sum[i] != geo.Checksum[i] {
-			return false
-		}
-	}
-	return true
+	return nil, 0, fmt.Errorf("no valid LPMP geometry found")
 }
 
 func (sp *SuperImage) readMetadataSlot(offset int64) error {
-	buf := make([]byte, sp.Geometry.MetadataMaxSize)
+	maxSize := int64(sp.Geometry.MetadataMaxSize)
+	buf := make([]byte, maxSize)
 	n, err := sp.file.ReadAt(buf, offset)
 	if err != nil && err != io.EOF {
-		return fmt.Errorf("cannot read metadata slot at %d: %w", offset, err)
+		return fmt.Errorf("read slot: %w", err)
 	}
 	if n < LpMetadataHeaderSize {
-		return fmt.Errorf("metadata slot too small: %d bytes", n)
+		return fmt.Errorf("slot too small: %d", n)
 	}
 
-	// Parse header
-	var header LpMetadataHeader
-	copy(header.Magic[:], buf[0:4])
-	header.MajorVersion = binary.LittleEndian.Uint32(buf[4:8])
-	header.MinorVersion = binary.LittleEndian.Uint32(buf[8:12])
-	header.HeaderSize = binary.LittleEndian.Uint32(buf[12:16])
-	header.NumPartitions = binary.LittleEndian.Uint32(buf[16:20])
-	header.NumExtents = binary.LittleEndian.Uint32(buf[20:24])
-
-	if string(header.Magic[:]) != "LPMH" {
-		return fmt.Errorf("invalid metadata header magic")
+	magic := string(buf[0:4])
+	if magic != "LPMH" {
+		return fmt.Errorf("bad magic: %s", magic)
 	}
-	if header.MajorVersion != 10 {
-		return fmt.Errorf("unsupported metadata version: %d.%d", header.MajorVersion, header.MinorVersion)
+	majorVer := binary.LittleEndian.Uint32(buf[4:8])
+	if majorVer != 10 {
+		return fmt.Errorf("unsupported version: %d", majorVer)
 	}
 
-	// Calculate the start of partition entries
-	headerSize := int64(header.HeaderSize)
-	if headerSize < int64(LpMetadataHeaderSize) {
-		headerSize = int64(LpMetadataHeaderSize)
+	headerSize := int64(binary.LittleEndian.Uint32(buf[12:16]))
+	numParts := binary.LittleEndian.Uint32(buf[16:20])
+	numExts := binary.LittleEndian.Uint32(buf[20:24])
+
+	if headerSize < LpMetadataHeaderSize {
+		headerSize = LpMetadataHeaderSize
+	}
+	if int(headerSize) >= n {
+		return fmt.Errorf("header beyond buffer")
 	}
 
-	// Read all extents first (they come after all partition entries)
-	// First pass: skip over partition entries to find extents
-	extentOffset := headerSize
-	for i := uint32(0); i < header.NumPartitions; i++ {
-		if int(extentOffset+16) > n {
-			break
+	// Find extent table location (after all partition entries)
+	extOff := headerSize
+	for i := uint32(0); i < numParts; i++ {
+		if int(extOff+4) > n {
+			return fmt.Errorf("truncated part %d", i)
 		}
-		nameSize := binary.LittleEndian.Uint32(buf[extentOffset : extentOffset+4])
-		entrySize := int64(16 + nameSize)
-		extentOffset += entrySize
+		ns := binary.LittleEndian.Uint32(buf[extOff : extOff+4])
+		extOff += int64(16 + ns)
+	}
+
+	if int(extOff+32*int64(numExts)) > n {
+		return fmt.Errorf("truncated extents")
 	}
 
 	// Read extents
-	extents := make([]LpMetadataExtent, header.NumExtents)
-	for i := uint32(0); i < header.NumExtents; i++ {
-		eStart := extentOffset + int64(i)*32
-		if int(eStart+32) > n {
-			return fmt.Errorf("extent %d exceeds metadata slot", i)
-		}
+	extents := make([]LpMetadataExtent, numExts)
+	for i := uint32(0); i < numExts; i++ {
+		es := extOff + int64(i)*32
 		extents[i] = LpMetadataExtent{
-			NumSectors:      binary.LittleEndian.Uint64(buf[eStart : eStart+8]),
-			Sector:          binary.LittleEndian.Uint64(buf[eStart+8 : eStart+16]),
-			PartitionSector: binary.LittleEndian.Uint64(buf[eStart+16 : eStart+24]),
-			Type:            binary.LittleEndian.Uint64(buf[eStart+24 : eStart+32]),
+			NumSectors:      binary.LittleEndian.Uint64(buf[es : es+8]),
+			Sector:          binary.LittleEndian.Uint64(buf[es+8 : es+16]),
+			PartitionSector: binary.LittleEndian.Uint64(buf[es+16 : es+24]),
+			Type:            binary.LittleEndian.Uint64(buf[es+24 : es+32]),
 		}
 	}
 
 	// Read partitions
-	partOffset := headerSize
-	for i := uint32(0); i < header.NumPartitions; i++ {
-		if int(partOffset+16) > n {
+	partOff := headerSize
+	for i := uint32(0); i < numParts; i++ {
+		if int(partOff+16) > n {
 			break
 		}
-
-		nameSize := binary.LittleEndian.Uint32(buf[partOffset : partOffset+4])
-		attributes := binary.LittleEndian.Uint32(buf[partOffset+4 : partOffset+8])
-		firstExtIdx := binary.LittleEndian.Uint32(buf[partOffset+8 : partOffset+12])
-		numExts := binary.LittleEndian.Uint32(buf[partOffset+12 : partOffset+16])
+		ns := binary.LittleEndian.Uint32(buf[partOff : partOff+4])
+		attr := binary.LittleEndian.Uint32(buf[partOff+4 : partOff+8])
+		fi := binary.LittleEndian.Uint32(buf[partOff+8 : partOff+12])
+		ne := binary.LittleEndian.Uint32(buf[partOff+12 : partOff+16])
 
 		var name string
-		if nameSize > 0 {
-			nameEnd := partOffset + 16 + int64(nameSize)
-			if int(nameEnd) <= n {
-				nameBytes := buf[partOffset+16 : nameEnd]
-				// Trim null terminator
-				for j := 0; j < len(nameBytes); j++ {
-					if nameBytes[j] == 0 {
-						nameBytes = nameBytes[:j]
+		if ns > 0 {
+			end := partOff + 16 + int64(ns)
+			if int(end) <= n {
+				nb := buf[partOff+16 : end]
+				for j := 0; j < len(nb); j++ {
+					if nb[j] == 0 {
+						nb = nb[:j]
 						break
 					}
 				}
-				name = string(nameBytes)
+				name = string(nb)
 			}
 		}
+		_ = attr
 
-		_ = attributes
-
-		// Collect extents for this partition
-		var partExtents []LpMetadataExtent
-		var partSize uint64
-		for j := firstExtIdx; j < firstExtIdx+numExts && j < uint32(len(extents)); j++ {
-			partExtents = append(partExtents, extents[j])
-			partSize += extents[j].NumSectors * SectorSize
+		var pSize uint64
+		var pExt []LpMetadataExtent
+		for j := fi; j < fi+ne && j < uint32(len(extents)); j++ {
+			pExt = append(pExt, extents[j])
+			pSize += extents[j].NumSectors * SectorSize
 		}
 
 		sp.Partitions = append(sp.Partitions, PartitionInfo{
-			Name:    name,
-			Size:    partSize,
-			Extents: partExtents,
+			Name: name, Size: pSize, Extents: pExt,
 		})
-
-		partOffset += int64(16 + nameSize)
+		partOff += int64(16 + ns)
 	}
 
 	return nil
 }
 
-// Close closes the super image file
-func (sp *SuperImage) Close() error {
-	return sp.file.Close()
-}
-
-// alignDown rounds value down to the nearest multiple
-func alignDown(value, alignment int64) int64 {
-	return (value / alignment) * alignment
-}
-
-// formatSize formats bytes to human-readable
-func formatSize(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
+func formatSize(b int64) string {
+	const u = 1024
+	if b < u {
+		return fmt.Sprintf("%d B", b)
 	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
+	d, e := int64(u), 0
+	for n := b / u; n >= u; n /= u {
+		d *= u
+		e++
 	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(d), "KMGTPE"[e])
 }
