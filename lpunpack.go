@@ -10,22 +10,16 @@ import (
 	"path/filepath"
 )
 
-// Extractor handles partition extraction from super image
 type Extractor struct {
 	Input   string
 	Output  string
 	Verbose bool
 }
 
-// NewExtractor creates a new extractor
 func NewExtractor(input, output string) *Extractor {
-	return &Extractor{
-		Input:   input,
-		Output:  output,
-	}
+	return &Extractor{Input: input, Output: output}
 }
 
-// Extract extracts all partitions from the super image
 func (e *Extractor) Extract() error {
 	super, err := OpenSuperImage(e.Input)
 	if err != nil {
@@ -34,15 +28,12 @@ func (e *Extractor) Extract() error {
 	defer super.Close()
 
 	if e.Verbose {
-		fmt.Printf("Super Image: %s (%d bytes)\n", e.Input, super.FileSize)
-		fmt.Printf("  Block Size: %d\n", super.Geometry.LogicalBlockSize)
-		fmt.Printf("  Metadata Slots: %d\n", super.Geometry.MetadataSlotCount)
+		fmt.Printf("Super Image: %s (%s)\n", e.Input, formatSize(super.FileSize))
 		fmt.Printf("  Partitions: %d\n\n", len(super.Partitions))
 	}
 
-	// Create output directory
 	if err := os.MkdirAll(e.Output, 0755); err != nil {
-		return fmt.Errorf("cannot create output directory: %w", err)
+		return fmt.Errorf("cannot create output dir: %w", err)
 	}
 
 	extracted := 0
@@ -50,9 +41,8 @@ func (e *Extractor) Extract() error {
 		if e.Verbose {
 			fmt.Printf("Extracting %s (%s)...\n", part.Name, formatSize(int64(part.Size)))
 		}
-
 		if err := e.extractPartition(super, part); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to extract %s: %v\n", part.Name, err)
+			fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", part.Name, err)
 			continue
 		}
 		extracted++
@@ -65,48 +55,36 @@ func (e *Extractor) Extract() error {
 }
 
 func (e *Extractor) extractPartition(super *SuperImage, part PartitionInfo) error {
-	outputPath := filepath.Join(e.Output, part.Name+".img")
-
-	outFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	outPath := filepath.Join(e.Output, part.Name+".img")
+	out, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return fmt.Errorf("cannot create output file: %w", err)
+		return fmt.Errorf("cannot create: %w", err)
 	}
-	defer outFile.Close()
+	defer out.Close()
 
-	// Pre-allocate
 	if part.Size > 0 {
-		outFile.Truncate(int64(part.Size))
+		out.Truncate(int64(part.Size))
 	}
 
 	for idx, ext := range part.Extents {
 		if ext.Type != LpMetadataExtentTypeLinear {
-			if e.Verbose {
-				fmt.Fprintf(os.Stderr, "  Warning: extent %d has unknown type %d, skipping\n", idx, ext.Type)
-			}
 			continue
 		}
-
-		// Calculate byte offsets
-		physicalOffset := ext.Sector * SectorSize
-		dataSize := ext.NumSectors * SectorSize
-
+		physOff := int64(ext.Sector * SectorSize)
+		dataSize := int64(ext.NumSectors * SectorSize)
 		if dataSize == 0 {
 			continue
 		}
-
-		// Read from super image and write to output
-		if _, err := outFile.Seek(int64(ext.PartitionSector*SectorSize), io.SeekStart); err != nil {
-			return fmt.Errorf("cannot seek in output: %w", err)
+		if _, err := out.Seek(int64(ext.PartitionSector*SectorSize), io.SeekStart); err != nil {
+			return fmt.Errorf("seek: %w", err)
 		}
-
-		written, err := io.CopyN(outFile, io.NewSectionReader(super.file, int64(physicalOffset), int64(dataSize)), int64(dataSize))
+		written, err := io.CopyN(out, io.NewSectionReader(super.file, physOff, dataSize), dataSize)
 		if err != nil {
-			return fmt.Errorf("failed to copy extent %d: %w", idx, err)
+			return fmt.Errorf("extent %d: %w", idx, err)
 		}
-		if uint64(written) != dataSize {
-			return fmt.Errorf("short write for extent %d: %d != %d", idx, written, dataSize)
+		if written != dataSize {
+			return fmt.Errorf("extent %d short: %d != %d", idx, written, dataSize)
 		}
 	}
-
 	return nil
 }
