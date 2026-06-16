@@ -426,7 +426,7 @@ func parseHeader(buf []byte) (*LpMetadataHeader, error) {
 	if h.MinorVersion > LP_METADATA_MINOR_VERSION_MAX {
 		return nil, fmt.Errorf("version too new %d.%d", h.MajorVersion, h.MinorVersion)
 	}
-	if h.HeaderSize < 160 || h.HeaderSize > 164 {
+	if h.HeaderSize < 160 {
 		return nil, fmt.Errorf("invalid header size: %d", h.HeaderSize)
 	}
 	tmp := make([]byte, h.HeaderSize)
