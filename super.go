@@ -30,6 +30,7 @@ const (
 
 // ---- AOSP liblp structs ----
 
+// LpMetadataGeometry (52 bytes)
 type LpMetadataGeometry struct {
 	Magic             uint32
 	StructSize        uint32
@@ -39,32 +40,47 @@ type LpMetadataGeometry struct {
 	LogicalBlockSize  uint32
 }
 
+// LpMetadataTableDescriptor (12 bytes in AOSP: all uint32!)
 type LpMetadataTableDescriptor struct {
-	Offset      uint64
-	NumElements uint64
-	ElementSize uint32
+	Offset      uint32 // offset from end of header
+	NumElements uint32 // number of entries
+	ElementSize uint32 // size of each entry
 }
 
+// LpMetadataHeader (V1_0 = 128 bytes, V1_2 = 132 bytes, actual file may have more)
 type LpMetadataHeader struct {
-	Magic          uint32
-	MajorVersion   uint16
-	MinorVersion   uint16
-	HeaderSize     uint32
-	HeaderChecksum [32]byte
-	TablesSize     uint32
-	TablesChecksum [32]byte
-	Partitions     LpMetadataTableDescriptor
-	Extents        LpMetadataTableDescriptor
-	Groups         LpMetadataTableDescriptor
-	BlockDevices   LpMetadataTableDescriptor
-	Flags          uint32
+	Magic          uint32   // 0
+	MajorVersion   uint16   // 4
+	MinorVersion   uint16   // 6
+	HeaderSize     uint32   // 8
+	HeaderChecksum [32]byte // 12
+	TablesSize     uint32   // 44
+	TablesChecksum [32]byte // 48
+	// V1_0/V1_2 fields end at 80, then table descriptors (12 bytes each)
+	Partitions   LpMetadataTableDescriptor // 80
+	Extents      LpMetadataTableDescriptor // 92
+	Groups       LpMetadataTableDescriptor // 104
+	BlockDevices LpMetadataTableDescriptor // 116
+	// V1_2+: flags at 128
+	// File may have more bytes (header_size=256)
+	Flags uint32 // 128
 }
 
+// LpMetadataExtent (24 bytes)
 type LpMetadataExtent struct {
-	NumSectors   uint64
-	TargetType   uint32
-	TargetData   uint64
-	TargetSource uint32
+	NumSectors   uint64 // 0
+	TargetType   uint32 // 8
+	TargetData   uint64 // 12
+	TargetSource uint32 // 20
+}
+
+// LpMetadataPartition (16 + name_size bytes, but usually 52 with 36-byte name)
+type LpMetadataPartition struct {
+	NameSize         uint32   // 0
+	Attributes       uint32   // 4
+	FirstExtentIndex uint32   // 8
+	NumExtents       uint32   // 12
+	// Name at offset 16, variable length
 }
 
 type PartitionInfo struct {
@@ -118,13 +134,9 @@ func parseGeometry(buf []byte) (*LpMetadataGeometry, error) {
 	if g.Magic != LP_METADATA_GEOMETRY_MAGIC {
 		return nil, fmt.Errorf("invalid magic")
 	}
-	if g.StructSize > 52 {
-		return nil, fmt.Errorf("struct_size too large: %d", g.StructSize)
-	}
 	if g.StructSize != 52 {
 		return nil, fmt.Errorf("invalid struct size: %d", g.StructSize)
 	}
-		// Verify checksum
 	tmp := make([]byte, 52)
 	copy(tmp, buf[:52])
 	for i := 8; i < 40; i++ {
@@ -152,11 +164,10 @@ func readGeometryAt(f *os.File, offset int64) (*LpMetadataGeometry, error) {
 
 // ---- Geometry scanning ----
 
-// Geometry magic in LE bytes
 var geomMagicPattern = []byte{0x67, 0x44, 0x6c, 0x61}
 
 func indexBytes(data, pattern []byte) int {
-	if len(pattern) == 0 || len(data) < len(pattern) {
+	if len(data) < len(pattern) {
 		return -1
 	}
 	for i := 0; i <= len(data)-len(pattern); i++ {
@@ -174,7 +185,6 @@ func indexBytes(data, pattern []byte) int {
 	return -1
 }
 
-// Scan a region of the file for geometry magic, return valid geometry if found
 func (sp *SuperImage) scanRegion(start, length int64) (*LpMetadataGeometry, int64, error) {
 	end := start + length
 	if end > sp.FileSize {
@@ -182,7 +192,6 @@ func (sp *SuperImage) scanRegion(start, length int64) (*LpMetadataGeometry, int6
 	}
 	pos := start
 	overlap := make([]byte, 0, 4)
-
 	for pos < end {
 		chunkSize := int64(SCAN_CHUNK_SIZE)
 		if pos+chunkSize > end {
@@ -191,20 +200,16 @@ func (sp *SuperImage) scanRegion(start, length int64) (*LpMetadataGeometry, int6
 		if chunkSize < 4 {
 			break
 		}
-
 		buf := make([]byte, chunkSize)
 		n, err := sp.file.ReadAt(buf, pos)
 		if err != nil || n < 4 {
 			break
 		}
 		data := buf[:n]
-
-		// Combine with overlap from previous chunk
 		searchData := data
 		if len(overlap) > 0 {
 			searchData = append(overlap, data...)
 		}
-
 		idx := 0
 		for {
 			hit := indexBytes(searchData[idx:], geomMagicPattern)
@@ -216,8 +221,6 @@ func (sp *SuperImage) scanRegion(start, length int64) (*LpMetadataGeometry, int6
 			if len(overlap) > 0 {
 				absOff = pos - int64(len(overlap)) + int64(relOff)
 			}
-
-			// Try to read and parse geometry at this offset
 			if absOff+52 <= sp.FileSize {
 				geoBuf := make([]byte, 52)
 				if _, e := sp.file.ReadAt(geoBuf, absOff); e == nil {
@@ -228,8 +231,6 @@ func (sp *SuperImage) scanRegion(start, length int64) (*LpMetadataGeometry, int6
 			}
 			idx += hit + 1
 		}
-
-		// Save last 3 bytes for overlap with next chunk
 		if n >= 3 {
 			overlap = append(overlap[:0], buf[n-3:n]...)
 		} else {
@@ -242,16 +243,15 @@ func (sp *SuperImage) scanRegion(start, length int64) (*LpMetadataGeometry, int6
 
 func (sp *SuperImage) scanFile() (*LpMetadataGeometry, int64, error) {
 	if sp.Verbose {
-		fmt.Fprintf(os.Stderr, "  Scanning entire file for geometry (may take a while)...\n")
+		fmt.Fprintf(os.Stderr, "  Scanning entire file for geometry...\n")
 	}
 	chunkSize := int64(SCAN_CHUNK_SIZE)
 	overlap := make([]byte, 0, 4)
 	nextReport := int64(0)
-	reportStep := sp.FileSize / 20 // 5% increments
+	reportStep := sp.FileSize / 20
 	if reportStep < chunkSize {
 		reportStep = chunkSize
 	}
-
 	for pos := int64(0); pos < sp.FileSize; pos += chunkSize {
 		readSize := chunkSize
 		if pos+readSize > sp.FileSize {
@@ -263,14 +263,12 @@ func (sp *SuperImage) scanFile() (*LpMetadataGeometry, int64, error) {
 			break
 		}
 		data := buf[:n]
-
 		searchData := data
 		if len(overlap) > 0 {
 			searchData = make([]byte, len(overlap)+n)
 			copy(searchData, overlap)
 			copy(searchData[len(overlap):], data)
 		}
-
 		idx := 0
 		for {
 			hit := indexBytes(searchData[idx:], geomMagicPattern)
@@ -282,14 +280,12 @@ func (sp *SuperImage) scanFile() (*LpMetadataGeometry, int64, error) {
 			if len(overlap) > 0 {
 				absOff = pos - int64(len(overlap)) + int64(relOff)
 			}
-
 			if absOff+52 <= sp.FileSize {
 				geoBuf := make([]byte, 52)
 				if _, e := sp.file.ReadAt(geoBuf, absOff); e == nil {
 					if g, e := parseGeometry(geoBuf); e == nil {
 						if sp.Verbose {
-							fmt.Fprintf(os.Stderr, "\n  Valid geometry at offset %d (%.2f MB)\n",
-								absOff, float64(absOff)/1048576)
+							fmt.Fprintf(os.Stderr, "\n  Geometry at offset %d\n", absOff)
 						}
 						return g, absOff, nil
 					}
@@ -297,13 +293,11 @@ func (sp *SuperImage) scanFile() (*LpMetadataGeometry, int64, error) {
 			}
 			idx += hit + 1
 		}
-
 		if n >= 3 {
 			overlap = append(overlap[:0], buf[n-3:n]...)
 		} else {
 			overlap = overlap[:0]
 		}
-
 		if sp.Verbose && pos >= nextReport {
 			pct := pos * 100 / sp.FileSize
 			fmt.Fprintf(os.Stderr, "\r  Scanning... %d%%", pct)
@@ -313,20 +307,16 @@ func (sp *SuperImage) scanFile() (*LpMetadataGeometry, int64, error) {
 	if sp.Verbose {
 		fmt.Fprintf(os.Stderr, "\r  Scanning... 100%%\n")
 	}
-	return nil, 0, fmt.Errorf("no valid geometry found")
+	return nil, 0, fmt.Errorf("no geometry found")
 }
 
-// ---- Main geometry entry point ----
-
 func (sp *SuperImage) findGeometry() (*LpMetadataGeometry, int64, error) {
+	// Method 1-2: Standard AOSP offsets
 	tryOffsets := []int64{
-		LP_PARTITION_RESERVED_BYTES,           // Standard primary: 4096
-		LP_PARTITION_RESERVED_BYTES + LP_METADATA_GEOMETRY_SIZE, // Standard backup: 8192
-		0, // Some images start at offset 0
-		512, // After GPT header
-		1024, // After GPT entries
+		LP_PARTITION_RESERVED_BYTES,
+		LP_PARTITION_RESERVED_BYTES + LP_METADATA_GEOMETRY_SIZE,
+		0, 512, 1024,
 	}
-
 	for _, off := range tryOffsets {
 		if off+52 > sp.FileSize {
 			continue
@@ -342,14 +332,10 @@ func (sp *SuperImage) findGeometry() (*LpMetadataGeometry, int64, error) {
 			fmt.Fprintf(os.Stderr, "  Offset %d: %v\n", off, err)
 		}
 	}
-
-	// Scan first 256MB + last 256MB
+	// Method 3: Scan first/last 256MB
 	if sp.Verbose {
-		fmt.Fprintf(os.Stderr, "  Scanning first/last %d MB for geometry...\n",
-			SCAN_LIMIT_BYTES/1024/1024)
+		fmt.Fprintf(os.Stderr, "  Scanning first/last %d MB...\n", SCAN_LIMIT_BYTES/1024/1024)
 	}
-
-	// Scan first 256MB
 	scanSize := int64(SCAN_LIMIT_BYTES)
 	if sp.FileSize < scanSize*2 {
 		scanSize = sp.FileSize / 2
@@ -358,19 +344,13 @@ func (sp *SuperImage) findGeometry() (*LpMetadataGeometry, int64, error) {
 	if err == nil {
 		return g, off, nil
 	}
-
-	// Scan last 256MB (different region)
 	if sp.FileSize > scanSize {
 		g, off, err = sp.scanRegion(sp.FileSize-scanSize, scanSize)
 		if err == nil {
 			return g, off, nil
 		}
 	}
-
-	// Full file scan as last resort
-	if sp.Verbose {
-		fmt.Fprintf(os.Stderr, "  Limited scan failed, scanning entire file...\n")
-	}
+	// Method 4: Full scan
 	return sp.scanFile()
 }
 
@@ -395,10 +375,10 @@ func backupMetadataOffset(g *LpMetadataGeometry, geoOffset int64, slot uint32) i
 	return start + int64(g.MetadataMaxSize)*int64(slot)
 }
 
-// ---- Metadata parsing ----
+// ---- Metadata header parsing ----
 
 func parseHeader(buf []byte) (*LpMetadataHeader, error) {
-	if len(buf) < 160 {
+	if len(buf) < 128 {
 		return nil, fmt.Errorf("buffer too small: %d", len(buf))
 	}
 	h := &LpMetadataHeader{}
@@ -409,14 +389,30 @@ func parseHeader(buf []byte) (*LpMetadataHeader, error) {
 	copy(h.HeaderChecksum[:], buf[12:44])
 	h.TablesSize = binary.LittleEndian.Uint32(buf[44:48])
 	copy(h.TablesChecksum[:], buf[48:80])
-	off := 80
-	h.Partitions = readDesc(buf, off)
-	h.Extents = readDesc(buf, off+20)
-	h.Groups = readDesc(buf, off+40)
-	h.BlockDevices = readDesc(buf, off+60)
-	if int(h.HeaderSize) >= off+80 {
-		h.Flags = binary.LittleEndian.Uint32(buf[off+80 : off+84])
+
+	// Table descriptors (12 bytes each, all uint32)
+	h.Partitions.Offset = binary.LittleEndian.Uint32(buf[80:84])
+	h.Partitions.NumElements = binary.LittleEndian.Uint32(buf[84:88])
+	h.Partitions.ElementSize = binary.LittleEndian.Uint32(buf[88:92])
+
+	h.Extents.Offset = binary.LittleEndian.Uint32(buf[92:96])
+	h.Extents.NumElements = binary.LittleEndian.Uint32(buf[96:100])
+	h.Extents.ElementSize = binary.LittleEndian.Uint32(buf[100:104])
+
+	h.Groups.Offset = binary.LittleEndian.Uint32(buf[104:108])
+	h.Groups.NumElements = binary.LittleEndian.Uint32(buf[108:112])
+	h.Groups.ElementSize = binary.LittleEndian.Uint32(buf[112:116])
+
+	h.BlockDevices.Offset = binary.LittleEndian.Uint32(buf[116:120])
+	h.BlockDevices.NumElements = binary.LittleEndian.Uint32(buf[120:124])
+	h.BlockDevices.ElementSize = binary.LittleEndian.Uint32(buf[124:128])
+
+	// Flags at byte 128 (V1.2+)
+	if int(h.HeaderSize) >= 132 {
+		h.Flags = binary.LittleEndian.Uint32(buf[128:132])
 	}
+
+	// Validate
 	if h.Magic != LP_METADATA_HEADER_MAGIC {
 		return nil, fmt.Errorf("invalid header magic")
 	}
@@ -426,9 +422,10 @@ func parseHeader(buf []byte) (*LpMetadataHeader, error) {
 	if h.MinorVersion > LP_METADATA_MINOR_VERSION_MAX {
 		return nil, fmt.Errorf("version too new %d.%d", h.MajorVersion, h.MinorVersion)
 	}
-	if h.HeaderSize < 160 {
+	if h.HeaderSize < 128 {
 		return nil, fmt.Errorf("invalid header size: %d", h.HeaderSize)
 	}
+	// Validate header checksum
 	tmp := make([]byte, h.HeaderSize)
 	copy(tmp, buf[:h.HeaderSize])
 	for i := 12; i < 44 && i < len(tmp); i++ {
@@ -440,13 +437,7 @@ func parseHeader(buf []byte) (*LpMetadataHeader, error) {
 	return h, nil
 }
 
-func readDesc(buf []byte, off int) LpMetadataTableDescriptor {
-	return LpMetadataTableDescriptor{
-		Offset:      binary.LittleEndian.Uint64(buf[off : off+8]),
-		NumElements: binary.LittleEndian.Uint64(buf[off+8 : off+16]),
-		ElementSize: binary.LittleEndian.Uint32(buf[off+16 : off+20]),
-	}
-}
+// ---- Metadata reading ----
 
 func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]PartitionInfo, error) {
 	buf := make([]byte, g.MetadataMaxSize)
@@ -459,12 +450,14 @@ func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]Par
 		return nil, err
 	}
 
+	// Check tables don't exceed metadata size
 	tblOff := int64(h.HeaderSize)
 	if tblOff+int64(h.TablesSize) > int64(g.MetadataMaxSize) {
 		return nil, fmt.Errorf("tables exceed metadata size")
 	}
 	td := buf[tblOff : tblOff+int64(h.TablesSize)]
 
+	// Validate tables checksum
 	if sha256.Sum256(td) != h.TablesChecksum {
 		return nil, fmt.Errorf("invalid table checksum")
 	}
@@ -475,14 +468,15 @@ func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]Par
 			h.Partitions.NumElements, h.Extents.NumElements)
 	}
 
+	// Parse block devices (needed for validation)
 	if h.BlockDevices.NumElements == 0 {
 		return nil, fmt.Errorf("no block devices")
 	}
 
 	// Parse extents
 	extents := make([]LpMetadataExtent, h.Extents.NumElements)
-	for i := uint64(0); i < h.Extents.NumElements; i++ {
-		eo := int64(h.Extents.Offset + i*uint64(h.Extents.ElementSize))
+	for i := uint32(0); i < h.Extents.NumElements; i++ {
+		eo := int64(h.Extents.Offset) + int64(i)*int64(h.Extents.ElementSize)
 		if eo+24 > int64(len(td)) {
 			return nil, fmt.Errorf("extent %d truncated", i)
 		}
@@ -491,36 +485,43 @@ func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]Par
 		extents[i].TargetData = binary.LittleEndian.Uint64(td[eo+12 : eo+20])
 		extents[i].TargetSource = binary.LittleEndian.Uint32(td[eo+20 : eo+24])
 		if extents[i].TargetType == LP_TARGET_TYPE_LINEAR &&
-			extents[i].TargetSource >= uint32(h.BlockDevices.NumElements) {
-			return nil, fmt.Errorf("extent %d: invalid block device %d", i, extents[i].TargetSource)
+			extents[i].TargetSource >= h.BlockDevices.NumElements {
+			return nil, fmt.Errorf("extent %d: invalid block device", i)
 		}
 	}
 
 	// Parse partitions
 	var parts []PartitionInfo
-	for i := uint64(0); i < h.Partitions.NumElements; i++ {
-		po := int64(h.Partitions.Offset + i*uint64(h.Partitions.ElementSize))
+	for i := uint32(0); i < h.Partitions.NumElements; i++ {
+		po := int64(h.Partitions.Offset) + int64(i)*int64(h.Partitions.ElementSize)
 		if po+16 > int64(len(td)) {
 			return nil, fmt.Errorf("partition %d truncated", i)
 		}
+		nameSize := binary.LittleEndian.Uint32(td[po : po+4])
 		attrs := binary.LittleEndian.Uint32(td[po+4 : po+8])
-		firstExt := int(binary.LittleEndian.Uint32(td[po+8 : po+12]))
-		numExt := int(binary.LittleEndian.Uint32(td[po+12 : po+16]))
+		firstExt := binary.LittleEndian.Uint32(td[po+8 : po+12])
+		numExt := binary.LittleEndian.Uint32(td[po+12 : po+16])
 
+		// Extract name from bytes after fixed fields
 		elemSize := int64(h.Partitions.ElementSize)
-		maxNameBytes := int(elemSize - 16)
-		if maxNameBytes > 36 {
-			maxNameBytes = 36
-		}
 		var name string
-		if maxNameBytes > 0 && po+16+int64(maxNameBytes) <= int64(len(td)) {
-			name = cString(td[po+16 : po+16+int64(maxNameBytes)])
+		if elemSize > 16 && po+elemSize <= int64(len(td)) {
+			name = cString(td[po+16 : po+elemSize])
+		}
+		if name == "" && nameSize > 0 {
+			maxNameLen := int64(nameSize)
+			if maxNameLen > elemSize-16 {
+				maxNameLen = elemSize - 16
+			}
+			if maxNameLen > 0 && po+16+maxNameLen <= int64(len(td)) {
+				name = cString(td[po+16 : po+16+maxNameLen])
+			}
 		}
 		if name == "" {
 			continue
 		}
 
-		if firstExt+numExt < firstExt || firstExt+numExt > len(extents) {
+		if int(firstExt)+int(numExt) > len(extents) {
 			return nil, fmt.Errorf("partition %s: invalid extent list", name)
 		}
 		if numExt == 0 {
@@ -553,9 +554,8 @@ func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]Par
 }
 
 func (sp *SuperImage) findMetadata(g *LpMetadataGeometry, geoOffset int64) ([]PartitionInfo, error) {
-	slot := uint32(0) // use _a
+	slot := uint32(0) // _a
 
-	// Try primary
 	off := primaryMetadataOffset(g, geoOffset, slot)
 	if sp.Verbose {
 		fmt.Fprintf(os.Stderr, "  Primary metadata offset: %d (%.2f MB)\n", off, float64(off)/1048576)
@@ -568,7 +568,6 @@ func (sp *SuperImage) findMetadata(g *LpMetadataGeometry, geoOffset int64) ([]Pa
 		fmt.Fprintf(os.Stderr, "  Primary metadata failed: %v\n", err)
 	}
 
-	// Try backup
 	off = backupMetadataOffset(g, geoOffset, slot)
 	if sp.Verbose {
 		fmt.Fprintf(os.Stderr, "  Backup metadata offset: %d (%.2f MB)\n", off, float64(off)/1048576)
@@ -583,15 +582,15 @@ func (sp *SuperImage) findMetadata(g *LpMetadataGeometry, geoOffset int64) ([]Pa
 // ---- Main parse ----
 
 func (sp *SuperImage) parse() error {
-	g, geoOffset, err := sp.findGeometry()
+	g, geoOff, err := sp.findGeometry()
 	if err != nil {
 		return err
 	}
 	if sp.Verbose {
 		fmt.Fprintf(os.Stderr, "  Geometry offset: %d, maxSize=%d slots=%d blockSize=%d\n",
-			geoOffset, g.MetadataMaxSize, g.MetadataSlotCount, g.LogicalBlockSize)
+			geoOff, g.MetadataMaxSize, g.MetadataSlotCount, g.LogicalBlockSize)
 	}
-	parts, err := sp.findMetadata(g, geoOffset)
+	parts, err := sp.findMetadata(g, geoOff)
 	if err != nil {
 		return err
 	}
