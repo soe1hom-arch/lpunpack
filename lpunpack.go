@@ -27,17 +27,6 @@ func (e *Extractor) Extract() error {
 	}
 	defer super.Close()
 
-	super.Verbose = e.Verbose
-
-	// Need to re-parse with Verbose set
-	// Actually, Verbose is set after Open, and parse() already ran in Open.
-	// Let me re-parse if verbose is needed.
-	if e.Verbose {
-		// Re-parse is not possible since parse sets Partitions.
-		// Verbose output during parse won't happen.
-	}
-	_ = super.Verbose
-
 	if e.Verbose {
 		fmt.Printf("Super Image: %s (%s)\n", e.Input, formatSize(super.FileSize))
 		fmt.Printf("  Partitions: %d\n\n", len(super.Partitions))
@@ -73,29 +62,35 @@ func (e *Extractor) extractPartition(super *SuperImage, part PartitionInfo) erro
 	}
 	defer out.Close()
 
+	// Pre-allocate
 	if part.Size > 0 {
 		out.Truncate(int64(part.Size))
 	}
 
+	written := int64(0)
 	for idx, ext := range part.Extents {
-		if ext.Type != LpMetadataExtentTypeLinear {
+		if ext.TargetType != LP_TARGET_TYPE_LINEAR {
 			continue
 		}
-		physOff := int64(ext.Sector * SectorSize)
-		dataSize := int64(ext.NumSectors * SectorSize)
+		physOff := int64(ext.TargetData * LP_SECTOR_SIZE)
+		dataSize := int64(ext.NumSectors * LP_SECTOR_SIZE)
 		if dataSize == 0 {
 			continue
 		}
-		if _, err := out.Seek(int64(ext.PartitionSector*SectorSize), io.SeekStart); err != nil {
-			return fmt.Errorf("seek: %w", err)
+
+		// Seek to current write position within output file
+		if _, err := out.Seek(written, io.SeekStart); err != nil {
+			return fmt.Errorf("seek output: %w", err)
 		}
-		written, err := io.CopyN(out, io.NewSectionReader(super.file, physOff, dataSize), dataSize)
+
+		n, err := io.CopyN(out, io.NewSectionReader(super.file, physOff, dataSize), dataSize)
 		if err != nil {
 			return fmt.Errorf("extent %d: %w", idx, err)
 		}
-		if written != dataSize {
-			return fmt.Errorf("extent %d short: %d != %d", idx, written, dataSize)
+		if n != dataSize {
+			return fmt.Errorf("extent %d short: %d != %d", idx, n, dataSize)
 		}
+		written += n
 	}
 	return nil
 }

@@ -4,27 +4,70 @@
 package main
 
 import (
-	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
+	"strings"
 )
 
+// AOSP liblp constants
 const (
-	LpMetadataExtentTypeLinear = 0
-	SectorSize                 = 512
-	ChunkSize                  = 1024 * 1024 // 1MB chunks
-	MaxBuf                     = 64 * 1024 * 1024
+	LP_METADATA_GEOMETRY_MAGIC    = 0x616c4467
+	LP_METADATA_HEADER_MAGIC      = 0x414C5030
+	LP_METADATA_MAJOR_VERSION     = 10
+	LP_METADATA_MINOR_VERSION_MIN = 0
+	LP_METADATA_MINOR_VERSION_MAX = 2
+	LP_METADATA_GEOMETRY_SIZE     = 4096
+	LP_SECTOR_SIZE                = 512
+	LP_PARTITION_RESERVED_BYTES   = 4096
+	LP_TARGET_TYPE_LINEAR         = 0
+	LP_TARGET_TYPE_ZERO           = 1
+	LP_PARTITION_ATTR_SLOT_SUFFIXED = 1 << 1
 )
 
-type LpMetadataExtent struct {
-	NumSectors      uint64
-	Sector          uint64
-	PartitionSector uint64
-	Type            uint64
+// LpMetadataGeometry (52 bytes)
+type LpMetadataGeometry struct {
+	Magic             uint32
+	StructSize        uint32
+	Checksum          [32]byte
+	MetadataMaxSize   uint32
+	MetadataSlotCount uint32
+	LogicalBlockSize  uint32
 }
 
+// LpMetadataTableDescriptor (20 bytes)
+type LpMetadataTableDescriptor struct {
+	Offset      uint64
+	NumElements uint64
+	ElementSize uint32
+}
+
+// LpMetadataHeader (V1_2 = 164 bytes, V1_0 = 160 bytes)
+type LpMetadataHeader struct {
+	Magic          uint32
+	MajorVersion   uint16
+	MinorVersion   uint16
+	HeaderSize     uint32
+	HeaderChecksum [32]byte
+	TablesSize     uint32
+	TablesChecksum [32]byte
+	Partitions     LpMetadataTableDescriptor
+	Extents        LpMetadataTableDescriptor
+	Groups         LpMetadataTableDescriptor
+	BlockDevices   LpMetadataTableDescriptor
+	Flags          uint32
+}
+
+// LpMetadataExtent (24 bytes)
+type LpMetadataExtent struct {
+	NumSectors   uint64
+	TargetType   uint32
+	TargetData   uint64
+	TargetSource uint32
+}
+
+// Parsed partition info for extraction
 type PartitionInfo struct {
 	Name    string
 	Size    uint64
@@ -35,8 +78,8 @@ type SuperImage struct {
 	Filename   string
 	FileSize   int64
 	Partitions []PartitionInfo
-	file       *os.File
 	Verbose    bool
+	file       *os.File
 }
 
 func OpenSuperImage(filename string, verbose bool) (*SuperImage, error) {
@@ -59,248 +102,332 @@ func OpenSuperImage(filename string, verbose bool) (*SuperImage, error) {
 
 func (sp *SuperImage) Close() error { return sp.file.Close() }
 
-func (sp *SuperImage) parse() error {
-	var candidates []struct {
-		offset int64
-		magic  string
+// ---- Geometry parsing ----
+
+func parseGeometry(buf []byte) (*LpMetadataGeometry, error) {
+	if len(buf) < 52 {
+		return nil, fmt.Errorf("geometry buffer too small: %d", len(buf))
+	}
+	g := &LpMetadataGeometry{}
+	g.Magic = binary.LittleEndian.Uint32(buf[0:4])
+	g.StructSize = binary.LittleEndian.Uint32(buf[4:8])
+	copy(g.Checksum[:], buf[8:40])
+	g.MetadataMaxSize = binary.LittleEndian.Uint32(buf[40:44])
+	g.MetadataSlotCount = binary.LittleEndian.Uint32(buf[44:48])
+	g.LogicalBlockSize = binary.LittleEndian.Uint32(buf[48:52])
+
+	if g.Magic != LP_METADATA_GEOMETRY_MAGIC {
+		return nil, fmt.Errorf("invalid geometry magic signature")
+	}
+	if g.StructSize > 52 {
+		return nil, fmt.Errorf("unrecognized geometry fields (struct_size=%d)", g.StructSize)
+	}
+	// Verify checksum
+	tmp := make([]byte, g.StructSize)
+	copy(tmp, buf[:g.StructSize])
+	for i := 8; i < 40 && i < len(tmp); i++ {
+		tmp[i] = 0
+	}
+	cs := sha256.Sum256(tmp)
+	if cs != g.Checksum {
+		return nil, fmt.Errorf("invalid geometry checksum")
+	}
+	if g.StructSize != 52 {
+		return nil, fmt.Errorf("invalid geometry struct size: %d", g.StructSize)
+	}
+	if g.MetadataSlotCount == 0 {
+		return nil, fmt.Errorf("invalid metadata slot count: 0")
+	}
+	if g.MetadataMaxSize%LP_SECTOR_SIZE != 0 {
+		return nil, fmt.Errorf("metadata max size not sector-aligned: %d", g.MetadataMaxSize)
+	}
+	return g, nil
+}
+
+func readGeometryAt(f *os.File, offset int64) (*LpMetadataGeometry, error) {
+	buf := make([]byte, LP_METADATA_GEOMETRY_SIZE)
+	if _, err := f.ReadAt(buf, offset); err != nil {
+		return nil, fmt.Errorf("read at %d: %w", offset, err)
+	}
+	return parseGeometry(buf)
+}
+
+func readGeometry(f *os.File, verbose bool) (*LpMetadataGeometry, error) {
+	// Primary: offset 4096
+	g, err := readGeometryAt(f, LP_PARTITION_RESERVED_BYTES)
+	if err == nil {
+		return g, nil
+	}
+	if verbose {
+		fmt.Fprintf(os.Stderr, "  Primary geometry failed: %v\n", err)
+	}
+	// Backup: offset 8192
+	g, err = readGeometryAt(f, LP_PARTITION_RESERVED_BYTES+LP_METADATA_GEOMETRY_SIZE)
+	if err == nil {
+		return g, nil
+	}
+	return nil, fmt.Errorf("no valid geometry found (primary and backup failed)")
+}
+
+// ---- Metadata offset calculations ----
+
+func primaryMetadataOffset(g *LpMetadataGeometry, slot uint32) int64 {
+	r := LP_PARTITION_RESERVED_BYTES + (LP_METADATA_GEOMETRY_SIZE * 2)
+	return int64(r) + int64(g.MetadataMaxSize)*int64(slot)
+}
+
+func backupMetadataOffset(g *LpMetadataGeometry, slot uint32) int64 {
+	start := int64(LP_PARTITION_RESERVED_BYTES + (LP_METADATA_GEOMETRY_SIZE * 2))
+	start += int64(g.MetadataMaxSize) * int64(g.MetadataSlotCount)
+	return start + int64(g.MetadataMaxSize)*int64(slot)
+}
+
+// ---- Metadata header parsing ----
+
+func parseHeader(buf []byte) (*LpMetadataHeader, error) {
+	if len(buf) < 160 {
+		return nil, fmt.Errorf("header buffer too small: %d", len(buf))
+	}
+	h := &LpMetadataHeader{}
+	h.Magic = binary.LittleEndian.Uint32(buf[0:4])
+	h.MajorVersion = binary.LittleEndian.Uint16(buf[4:6])
+	h.MinorVersion = binary.LittleEndian.Uint16(buf[6:8])
+	h.HeaderSize = binary.LittleEndian.Uint32(buf[8:12])
+	copy(h.HeaderChecksum[:], buf[12:44])
+	h.TablesSize = binary.LittleEndian.Uint32(buf[44:48])
+	copy(h.TablesChecksum[:], buf[48:80])
+
+	off := 80
+	readDesc := func(b []byte, o int) LpMetadataTableDescriptor {
+		return LpMetadataTableDescriptor{
+			Offset:      binary.LittleEndian.Uint64(b[o : o+8]),
+			NumElements: binary.LittleEndian.Uint64(b[o+8 : o+16]),
+			ElementSize: binary.LittleEndian.Uint32(b[o+16 : o+20]),
+		}
+	}
+	h.Partitions = readDesc(buf, off)
+	h.Extents = readDesc(buf, off+20)
+	h.Groups = readDesc(buf, off+40)
+	h.BlockDevices = readDesc(buf, off+60)
+
+	if int(h.HeaderSize) >= off+80 {
+		h.Flags = binary.LittleEndian.Uint32(buf[off+80 : off+84])
 	}
 
-	// Scan ENTIRE file for LPMH and LPMP in 1MB chunks
-	if sp.Verbose {
-		fmt.Printf("Scanning %d bytes in %dKB chunks...\n", sp.FileSize, ChunkSize/1024)
+	if h.Magic != LP_METADATA_HEADER_MAGIC {
+		return nil, fmt.Errorf("invalid metadata header magic")
+	}
+	if h.MajorVersion != LP_METADATA_MAJOR_VERSION {
+		return nil, fmt.Errorf("incompatible metadata version: %d.%d", h.MajorVersion, h.MinorVersion)
+	}
+	if h.MinorVersion > LP_METADATA_MINOR_VERSION_MAX {
+		return nil, fmt.Errorf("metadata version too new: %d.%d", h.MajorVersion, h.MinorVersion)
+	}
+	if h.HeaderSize < 160 || h.HeaderSize > 164 {
+		return nil, fmt.Errorf("invalid header size: %d", h.HeaderSize)
+	}
+	// Verify header checksum
+	tmp := make([]byte, h.HeaderSize)
+	copy(tmp, buf[:h.HeaderSize])
+	for i := 12; i < 44 && i < len(tmp); i++ {
+		tmp[i] = 0
+	}
+	cs := sha256.Sum256(tmp)
+	if cs != h.HeaderChecksum {
+		return nil, fmt.Errorf("invalid metadata header checksum")
+	}
+	return h, nil
+}
+
+// ---- Metadata table parsing ----
+
+func readMetadataAt(f *os.File, g *LpMetadataGeometry, offset int64, verbose bool) ([]PartitionInfo, error) {
+	buf := make([]byte, g.MetadataMaxSize)
+	if _, err := f.ReadAt(buf, offset); err != nil {
+		return nil, fmt.Errorf("read metadata at %d: %w", offset, err)
 	}
 
-	for off := int64(0); off < sp.FileSize; off += ChunkSize {
-		readSize := int64(ChunkSize)
-		remaining := sp.FileSize - off
-		if remaining < readSize {
-			readSize = remaining
-		}
-		buf := make([]byte, readSize)
-		n, err := sp.file.ReadAt(buf, off)
-		if err != nil && err != io.EOF {
-			continue
-		}
-		data := buf[:n]
-
-		for _, pattern := range [][]byte{{'L', 'P', 'M', 'H'}, {'L', 'P', 'M', 'P'}} {
-			idx := 0
-			for {
-				pos := bytes.Index(data[idx:], pattern)
-				if pos < 0 {
-					break
-				}
-				candidates = append(candidates, struct {
-					offset int64
-					magic  string
-				}{offset: off + int64(idx+pos), magic: string(pattern)})
-				idx += pos + 1
-			}
-		}
-
-		if sp.Verbose && off%(100*ChunkSize) == 0 {
-			fmt.Printf("  scanned %d MB so far...\n", off/1024/1024)
-		}
+	h, err := parseHeader(buf)
+	if err != nil {
+		return nil, err
 	}
 
-	if sp.Verbose {
-		fmt.Printf("Found %d magic signatures across entire file\n", len(candidates))
-		// Group by magic
-		lpmhCount := 0
-		lpmpCount := 0
-		for _, c := range candidates {
-			if c.magic == "LPMH" {
-				lpmhCount++
-			} else {
-				lpmpCount++
-			}
-		}
-		fmt.Printf("  LPMH: %d, LPMP: %d\n", lpmhCount, lpmpCount)
-		if lpmhCount > 0 {
-			fmt.Println("LPMH locations:")
-			for _, c := range candidates {
-				if c.magic == "LPMH" {
-					fmt.Printf("  offset %d (%.2f MB from start, %.2f MB from end)\n",
-						c.offset,
-						float64(c.offset)/1024/1024,
-						float64(sp.FileSize-c.offset)/1024/1024)
-				}
-			}
-		}
+	// Table data starts after the header
+	tblOff := int64(h.HeaderSize)
+	if tblOff+int64(h.TablesSize) > int64(g.MetadataMaxSize) {
+		return nil, fmt.Errorf("tables exceed metadata size")
+	}
+	td := buf[tblOff : tblOff+int64(h.TablesSize)]
+
+	// Verify table checksum
+	cs := sha256.Sum256(td)
+	if cs != h.TablesChecksum {
+		return nil, fmt.Errorf("invalid table checksum")
 	}
 
-	// Extract metadata_max_size from LPMP candidates
-	var bufSize int64 = 16 * 1024 * 1024
-	lpmpValid := 0
-	for _, c := range candidates {
-		if c.magic != "LPMP" {
-			continue
-		}
-		buf := make([]byte, 52)
-		if _, err := sp.file.ReadAt(buf, c.offset); err != nil {
-			continue
-		}
-		ss := binary.LittleEndian.Uint32(buf[4:8])
-		mms := binary.LittleEndian.Uint32(buf[40:44])
-		msc := binary.LittleEndian.Uint32(buf[44:48])
-		lbs := binary.LittleEndian.Uint32(buf[48:52])
-		if ss >= 12 && ss <= 4096 && mms >= 512 && mms <= MaxBuf && msc >= 1 && msc <= 32 {
-			bufSize = int64(mms)
-			lpmpValid++
-			if sp.Verbose {
-				fmt.Printf("  Valid LPMP@%d: structSize=%d maxSize=%d slots=%d blockSize=%d\n",
-					c.offset, ss, mms, msc, lbs)
-			}
-		}
-	}
-	if sp.Verbose && lpmpValid > 0 {
-		fmt.Printf("Using bufSize=%d from LPMP\n", bufSize)
-	} else if sp.Verbose {
-		fmt.Println("No valid LPMP found, using default bufSize=16MB")
+	if verbose {
+		fmt.Printf("  Metadata v%d.%d: %d partitions, %d extents\n",
+			h.MajorVersion, h.MinorVersion,
+			h.Partitions.NumElements, h.Extents.NumElements)
 	}
 
-	// Try to parse each LPMH
-	for _, c := range candidates {
-		if c.magic != "LPMH" {
+	// Parse block devices (needed for validation)
+	if h.BlockDevices.NumElements == 0 {
+		return nil, fmt.Errorf("no block devices in metadata")
+	}
+
+	// Parse extents
+	extents := make([]LpMetadataExtent, h.Extents.NumElements)
+	for i := uint64(0); i < h.Extents.NumElements; i++ {
+		eo := int64(h.Extents.Offset + i*uint64(h.Extents.ElementSize))
+		var e LpMetadataExtent
+		e.NumSectors = binary.LittleEndian.Uint64(td[eo : eo+8])
+		e.TargetType = binary.LittleEndian.Uint32(td[eo+8 : eo+12])
+		e.TargetData = binary.LittleEndian.Uint64(td[eo+12 : eo+20])
+		e.TargetSource = binary.LittleEndian.Uint32(td[eo+20 : eo+24])
+		if e.TargetType == LP_TARGET_TYPE_LINEAR &&
+			e.TargetSource >= uint32(h.BlockDevices.NumElements) {
+			return nil, fmt.Errorf("extent %d: invalid block device index %d", i, e.TargetSource)
+		}
+		extents[i] = e
+	}
+
+	// Parse partitions
+	var parts []PartitionInfo
+	for i := uint64(0); i < h.Partitions.NumElements; i++ {
+		po := int64(h.Partitions.Offset + i*uint64(h.Partitions.ElementSize))
+		if po+16 > int64(len(td)) {
+			return nil, fmt.Errorf("partition %d: truncated entry", i)
+		}
+		nameSize := binary.LittleEndian.Uint32(td[po : po+4])
+		attrs := binary.LittleEndian.Uint32(td[po+4 : po+8])
+		firstExt := int(binary.LittleEndian.Uint32(td[po+8 : po+12]))
+		numExt := int(binary.LittleEndian.Uint32(td[po+12 : po+16]))
+
+		// Extract partition name
+		var name string
+		maxNameBytes := int(int64(h.Partitions.ElementSize) - 16)
+		if maxNameBytes > 36 {
+			maxNameBytes = 36
+		}
+		if maxNameBytes > 0 {
+			nameBuf := td[po+16 : po+16+int64(maxNameBytes)]
+			name = cString(nameBuf)
+		}
+		// Fallback: use nameSize
+		if name == "" && nameSize > 0 && nameSize <= uint32(maxNameBytes) {
+			nameBuf := td[po+16 : po+16+int64(nameSize)]
+			name = cString(nameBuf)
+		}
+		if name == "" {
 			continue
 		}
 
-		buf := make([]byte, bufSize)
-		n, err := sp.file.ReadAt(buf, c.offset)
-		if err != nil && err != io.EOF {
-			continue
+		// Validate extent indices
+		if firstExt+numExt < firstExt || firstExt+numExt > len(extents) {
+			return nil, fmt.Errorf("partition %s: invalid extent list", name)
 		}
-		if n < 24 {
-			continue
-		}
-
-		major := binary.LittleEndian.Uint32(buf[4:8])
-		minor := binary.LittleEndian.Uint32(buf[8:12])
-		hdrSz := binary.LittleEndian.Uint32(buf[12:16])
-		numParts := binary.LittleEndian.Uint32(buf[16:20])
-		numExts := binary.LittleEndian.Uint32(buf[20:24])
-
-		if sp.Verbose {
-			fmt.Printf("  LPMH@%d: v%d.%d hdrSize=%d parts=%d exts=%d\n",
-				c.offset, major, minor, hdrSz, numParts, numExts)
-		}
-
-		if major != 10 && major != 0 {
-			continue
-		}
-		if numParts < 1 || numParts > 256 {
-			continue
-		}
-		if numExts > 65536 {
+		if numExt == 0 {
 			continue
 		}
 
-		hs := int64(hdrSz)
-		if hs < 24 {
-			hs = 24
-		}
-		if int(hs) >= n {
-			continue
-		}
-
-		extOff := hs
-		for i := uint32(0); i < numParts; i++ {
-			if int(extOff+4) > n {
-				return fmt.Errorf("part %d truncated at %d", i, extOff)
-			}
-			ns := binary.LittleEndian.Uint32(buf[extOff : extOff+4])
-			if ns > 256 {
-				extOff = -1
-				break
-			}
-			extOff += int64(16 + ns)
-		}
-		if extOff < 0 {
-			continue
-		}
-
-		needExt := extOff + 32*int64(numExts)
-		if int(needExt) > n {
-			continue
-		}
-
-		extents := make([]LpMetadataExtent, numExts)
-		for i := uint32(0); i < numExts; i++ {
-			es := extOff + int64(i)*32
-			extents[i] = LpMetadataExtent{
-				NumSectors:      binary.LittleEndian.Uint64(buf[es : es+8]),
-				Sector:          binary.LittleEndian.Uint64(buf[es+8 : es+16]),
-				PartitionSector: binary.LittleEndian.Uint64(buf[es+16 : es+24]),
-				Type:            binary.LittleEndian.Uint64(buf[es+24 : es+32]),
-			}
-			if extents[i].NumSectors == 0 && extents[i].Type == LpMetadataExtentTypeLinear {
-				extOff = -1
-				break
+		// Collect extents for this partition
+		var pExts []LpMetadataExtent
+		var pSize uint64
+		for j := firstExt; j < firstExt+numExt; j++ {
+			e := extents[j]
+			if e.TargetType == LP_TARGET_TYPE_LINEAR {
+				pExts = append(pExts, e)
+				pSize += e.NumSectors * LP_SECTOR_SIZE
 			}
 		}
-		if extOff < 0 {
-			continue
+
+		// Apply slot suffix (_a for slot 0)
+		if attrs&LP_PARTITION_ATTR_SLOT_SUFFIXED != 0 {
+			name += "_a"
 		}
 
-		sp.Partitions = nil
-		partOff := hs
-		for i := uint32(0); i < numParts; i++ {
-			if int(partOff+16) > n {
-				break
-			}
-			ns := binary.LittleEndian.Uint32(buf[partOff : partOff+4])
-			attr := binary.LittleEndian.Uint32(buf[partOff+4 : partOff+8])
-			fi := binary.LittleEndian.Uint32(buf[partOff+8 : partOff+12])
-			ne := binary.LittleEndian.Uint32(buf[partOff+12 : partOff+16])
-
-			var name string
-			if ns > 0 {
-				end := partOff + 16 + int64(ns)
-				if int(end) <= n {
-					nb := buf[partOff+16 : end]
-					for j := 0; j < len(nb); j++ {
-						if nb[j] == 0 {
-							nb = nb[:j]
-							break
-						}
-					}
-					name = string(nb)
-				}
-			}
-			_ = attr
-
-			var pSize uint64
-			var pExt []LpMetadataExtent
-			for j := fi; j < fi+ne && j < uint32(len(extents)); j++ {
-				pExt = append(pExt, extents[j])
-				pSize += extents[j].NumSectors * SectorSize
-			}
-			sp.Partitions = append(sp.Partitions, PartitionInfo{
-				Name: name, Size: pSize, Extents: pExt,
+		if pSize > 0 {
+			parts = append(parts, PartitionInfo{
+				Name:    name,
+				Size:    pSize,
+				Extents: pExts,
 			})
-			partOff += int64(16 + ns)
-		}
-
-		if len(sp.Partitions) > 0 {
-			if sp.Verbose {
-				fmt.Printf("  ✅ %d partitions found!\n", len(sp.Partitions))
-			}
-			return nil
 		}
 	}
 
-	return fmt.Errorf("no valid partition table found (scanned entire %d byte file, %d magic hits)", sp.FileSize, len(candidates))
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("no valid partitions found in metadata")
+	}
+	return parts, nil
+}
+
+func readMetadata(f *os.File, g *LpMetadataGeometry, verbose bool) ([]PartitionInfo, error) {
+	slot := uint32(0) // use slot 0 (_a)
+
+	off := primaryMetadataOffset(g, slot)
+	if verbose {
+		fmt.Printf("  Primary metadata offset: %d (%.2f MB)\n", off, float64(off)/1048576)
+	}
+	parts, err := readMetadataAt(f, g, off, verbose)
+	if err == nil {
+		return parts, nil
+	}
+	if verbose {
+		fmt.Fprintf(os.Stderr, "  Primary metadata failed: %v\n", err)
+	}
+
+	off = backupMetadataOffset(g, slot)
+	if verbose {
+		fmt.Printf("  Backup metadata offset: %d (%.2f MB)\n", off, float64(off)/1048576)
+	}
+	parts, err = readMetadataAt(f, g, off, verbose)
+	if err == nil {
+		return parts, nil
+	}
+	return nil, fmt.Errorf("no valid partition table found (primary and backup failed)")
+}
+
+// ---- Main parse entry point ----
+
+func (sp *SuperImage) parse() error {
+	g, err := readGeometry(sp.file, sp.Verbose)
+	if err != nil {
+		return err
+	}
+	if sp.Verbose {
+		fmt.Printf("  Geometry: maxSize=%d slots=%d blockSize=%d\n",
+			g.MetadataMaxSize, g.MetadataSlotCount, g.LogicalBlockSize)
+	}
+	parts, err := readMetadata(sp.file, g, sp.Verbose)
+	if err != nil {
+		return err
+	}
+	sp.Partitions = parts
+	return nil
+}
+
+// ---- Utilities ----
+
+func cString(buf []byte) string {
+	n := len(buf)
+	for i := 0; i < n; i++ {
+		if buf[i] == 0 {
+			return strings.TrimRight(string(buf[:i]), "\x00")
+		}
+	}
+	return strings.TrimRight(string(buf), "\x00")
 }
 
 func formatSize(b int64) string {
-	const u = 1024
-	if b < u {
+	const unit = 1024
+	if b < unit {
 		return fmt.Sprintf("%d B", b)
 	}
-	d, e := int64(u), 0
-	for n := b / u; n >= u; n /= u {
-		d *= u
-		e++
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
 	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(d), "KMGTPE"[e])
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
