@@ -30,7 +30,6 @@ const (
 
 // ---- AOSP liblp structs ----
 
-// LpMetadataGeometry (52 bytes)
 type LpMetadataGeometry struct {
 	Magic             uint32
 	StructSize        uint32
@@ -40,48 +39,41 @@ type LpMetadataGeometry struct {
 	LogicalBlockSize  uint32
 }
 
-// LpMetadataTableDescriptor (12 bytes in AOSP: all uint32!)
 type LpMetadataTableDescriptor struct {
-	Offset      uint32 // offset from end of header
-	NumElements uint32 // number of entries
-	ElementSize uint32 // size of each entry
+	Offset      uint32
+	NumElements uint32
+	ElementSize uint32
 }
 
-// LpMetadataHeader (V1_0 = 128 bytes, V1_2 = 132 bytes, actual file may have more)
 type LpMetadataHeader struct {
-	Magic          uint32   // 0
-	MajorVersion   uint16   // 4
-	MinorVersion   uint16   // 6
-	HeaderSize     uint32   // 8
-	HeaderChecksum [32]byte // 12
-	TablesSize     uint32   // 44
-	TablesChecksum [32]byte // 48
-	// V1_0/V1_2 fields end at 80, then table descriptors (12 bytes each)
-	Partitions   LpMetadataTableDescriptor // 80
-	Extents      LpMetadataTableDescriptor // 92
-	Groups       LpMetadataTableDescriptor // 104
-	BlockDevices LpMetadataTableDescriptor // 116
-	// V1_2+: flags at 128
-	// File may have more bytes (header_size=256)
-	Flags uint32 // 128
+	Magic          uint32
+	MajorVersion   uint16
+	MinorVersion   uint16
+	HeaderSize     uint32
+	HeaderChecksum [32]byte
+	TablesSize     uint32
+	TablesChecksum [32]byte
+	Partitions     LpMetadataTableDescriptor
+	Extents        LpMetadataTableDescriptor
+	Groups         LpMetadataTableDescriptor
+	BlockDevices   LpMetadataTableDescriptor
+	Flags          uint32
 }
 
-// LpMetadataExtent (24 bytes)
 type LpMetadataExtent struct {
-	NumSectors   uint64 // 0
-	TargetType   uint32 // 8
-	TargetData   uint64 // 12
-	TargetSource uint32 // 20
+	NumSectors   uint64
+	TargetType   uint32
+	TargetData   uint64
+	TargetSource uint32
 }
 
-// LpMetadataPartition (16 + name_size bytes, but usually 52 with 36-byte name)
+// AOSP LpMetadataPartition: name FIRST (36 bytes), then attrs/extents
 type LpMetadataPartition struct {
-	NameSize         uint32   // 0
-	Attributes       uint32   // 4
-	FirstExtentIndex uint32   // 8
-	NumExtents       uint32   // 12
-	// Name at offset 16, variable length
-}
+	Name             [36]byte // 0-35
+	Attributes       uint32   // 36-39
+	FirstExtentIndex uint32   // 40-43
+	NumExtents       uint32   // 44-47
+} // 48 bytes
 
 type PartitionInfo struct {
 	Name    string
@@ -117,7 +109,7 @@ func OpenSuperImage(filename string, verbose bool) (*SuperImage, error) {
 
 func (sp *SuperImage) Close() error { return sp.file.Close() }
 
-// ---- Geometry parsing ----
+// ---- Geometry ---- 
 
 func parseGeometry(buf []byte) (*LpMetadataGeometry, error) {
 	if len(buf) < 52 {
@@ -311,7 +303,6 @@ func (sp *SuperImage) scanFile() (*LpMetadataGeometry, int64, error) {
 }
 
 func (sp *SuperImage) findGeometry() (*LpMetadataGeometry, int64, error) {
-	// Method 1-2: Standard AOSP offsets
 	tryOffsets := []int64{
 		LP_PARTITION_RESERVED_BYTES,
 		LP_PARTITION_RESERVED_BYTES + LP_METADATA_GEOMETRY_SIZE,
@@ -328,11 +319,7 @@ func (sp *SuperImage) findGeometry() (*LpMetadataGeometry, int64, error) {
 			}
 			return g, off, nil
 		}
-		if sp.Verbose {
-			fmt.Fprintf(os.Stderr, "  Offset %d: %v\n", off, err)
-		}
 	}
-	// Method 3: Scan first/last 256MB
 	if sp.Verbose {
 		fmt.Fprintf(os.Stderr, "  Scanning first/last %d MB...\n", SCAN_LIMIT_BYTES/1024/1024)
 	}
@@ -350,7 +337,6 @@ func (sp *SuperImage) findGeometry() (*LpMetadataGeometry, int64, error) {
 			return g, off, nil
 		}
 	}
-	// Method 4: Full scan
 	return sp.scanFile()
 }
 
@@ -375,7 +361,7 @@ func backupMetadataOffset(g *LpMetadataGeometry, geoOffset int64, slot uint32) i
 	return start + int64(g.MetadataMaxSize)*int64(slot)
 }
 
-// ---- Metadata header parsing ----
+// ---- Metadata parsing ----
 
 func parseHeader(buf []byte) (*LpMetadataHeader, error) {
 	if len(buf) < 128 {
@@ -390,29 +376,28 @@ func parseHeader(buf []byte) (*LpMetadataHeader, error) {
 	h.TablesSize = binary.LittleEndian.Uint32(buf[44:48])
 	copy(h.TablesChecksum[:], buf[48:80])
 
-	// Table descriptors (12 bytes each, all uint32)
-	h.Partitions.Offset = binary.LittleEndian.Uint32(buf[80:84])
-	h.Partitions.NumElements = binary.LittleEndian.Uint32(buf[84:88])
-	h.Partitions.ElementSize = binary.LittleEndian.Uint32(buf[88:92])
+	// Table descriptors: 12 bytes each, uint32 fields
+	off := 80
+	h.Partitions.Offset = binary.LittleEndian.Uint32(buf[off:]); off+=4
+	h.Partitions.NumElements = binary.LittleEndian.Uint32(buf[off:]); off+=4
+	h.Partitions.ElementSize = binary.LittleEndian.Uint32(buf[off:]); off+=4
 
-	h.Extents.Offset = binary.LittleEndian.Uint32(buf[92:96])
-	h.Extents.NumElements = binary.LittleEndian.Uint32(buf[96:100])
-	h.Extents.ElementSize = binary.LittleEndian.Uint32(buf[100:104])
+	h.Extents.Offset = binary.LittleEndian.Uint32(buf[off:]); off+=4
+	h.Extents.NumElements = binary.LittleEndian.Uint32(buf[off:]); off+=4
+	h.Extents.ElementSize = binary.LittleEndian.Uint32(buf[off:]); off+=4
 
-	h.Groups.Offset = binary.LittleEndian.Uint32(buf[104:108])
-	h.Groups.NumElements = binary.LittleEndian.Uint32(buf[108:112])
-	h.Groups.ElementSize = binary.LittleEndian.Uint32(buf[112:116])
+	h.Groups.Offset = binary.LittleEndian.Uint32(buf[off:]); off+=4
+	h.Groups.NumElements = binary.LittleEndian.Uint32(buf[off:]); off+=4
+	h.Groups.ElementSize = binary.LittleEndian.Uint32(buf[off:]); off+=4
 
-	h.BlockDevices.Offset = binary.LittleEndian.Uint32(buf[116:120])
-	h.BlockDevices.NumElements = binary.LittleEndian.Uint32(buf[120:124])
-	h.BlockDevices.ElementSize = binary.LittleEndian.Uint32(buf[124:128])
+	h.BlockDevices.Offset = binary.LittleEndian.Uint32(buf[off:]); off+=4
+	h.BlockDevices.NumElements = binary.LittleEndian.Uint32(buf[off:]); off+=4
+	h.BlockDevices.ElementSize = binary.LittleEndian.Uint32(buf[off:]); off+=4
 
-	// Flags at byte 128 (V1.2+)
-	if int(h.HeaderSize) >= 132 {
-		h.Flags = binary.LittleEndian.Uint32(buf[128:132])
+	if int(h.HeaderSize) >= off+4 {
+		h.Flags = binary.LittleEndian.Uint32(buf[off:off+4])
 	}
 
-	// Validate
 	if h.Magic != LP_METADATA_HEADER_MAGIC {
 		return nil, fmt.Errorf("invalid header magic")
 	}
@@ -437,7 +422,7 @@ func parseHeader(buf []byte) (*LpMetadataHeader, error) {
 	return h, nil
 }
 
-// ---- Metadata reading ----
+// ---- Metadata tables parsing ----
 
 func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]PartitionInfo, error) {
 	buf := make([]byte, g.MetadataMaxSize)
@@ -450,14 +435,12 @@ func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]Par
 		return nil, err
 	}
 
-	// Check tables don't exceed metadata size
 	tblOff := int64(h.HeaderSize)
 	if tblOff+int64(h.TablesSize) > int64(g.MetadataMaxSize) {
 		return nil, fmt.Errorf("tables exceed metadata size")
 	}
 	td := buf[tblOff : tblOff+int64(h.TablesSize)]
 
-	// Validate tables checksum
 	if sha256.Sum256(td) != h.TablesChecksum {
 		return nil, fmt.Errorf("invalid table checksum")
 	}
@@ -468,7 +451,6 @@ func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]Par
 			h.Partitions.NumElements, h.Extents.NumElements)
 	}
 
-	// Parse block devices (needed for validation)
 	if h.BlockDevices.NumElements == 0 {
 		return nil, fmt.Errorf("no block devices")
 	}
@@ -491,46 +473,40 @@ func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]Par
 	}
 
 	// Parse partitions
+	// AOSP LpMetadataPartition layout:
+	//   name[36] + attributes(4) + first_extent(4) + num_extents(4) = 48 bytes
 	var parts []PartitionInfo
 	for i := uint32(0); i < h.Partitions.NumElements; i++ {
 		po := int64(h.Partitions.Offset) + int64(i)*int64(h.Partitions.ElementSize)
-		if po+16 > int64(len(td)) {
+		_ = h.Partitions.ElementSize
+
+		if po+48 > int64(len(td)) {
 			return nil, fmt.Errorf("partition %d truncated", i)
 		}
-		nameSize := binary.LittleEndian.Uint32(td[po : po+4])
-		attrs := binary.LittleEndian.Uint32(td[po+4 : po+8])
-		firstExt := binary.LittleEndian.Uint32(td[po+8 : po+12])
-		numExt := binary.LittleEndian.Uint32(td[po+12 : po+16])
 
-		// Extract name from bytes after fixed fields
-		elemSize := int64(h.Partitions.ElementSize)
-		var name string
-		if elemSize > 16 && po+elemSize <= int64(len(td)) {
-			name = cString(td[po+16 : po+elemSize])
-		}
-		if name == "" && nameSize > 0 {
-			maxNameLen := int64(nameSize)
-			if maxNameLen > elemSize-16 {
-				maxNameLen = elemSize - 16
-			}
-			if maxNameLen > 0 && po+16+maxNameLen <= int64(len(td)) {
-				name = cString(td[po+16 : po+16+maxNameLen])
-			}
-		}
+		// Read fixed struct (48 bytes)
+		var part LpMetadataPartition
+		copy(part.Name[:], td[po:po+36])
+		part.Attributes = binary.LittleEndian.Uint32(td[po+36 : po+40])
+		part.FirstExtentIndex = binary.LittleEndian.Uint32(td[po+40 : po+44])
+		part.NumExtents = binary.LittleEndian.Uint32(td[po+44 : po+48])
+
+		name := cString(part.Name[:])
 		if name == "" {
 			continue
 		}
 
-		if int(firstExt)+int(numExt) > len(extents) {
-			return nil, fmt.Errorf("partition %s: invalid extent list", name)
+		if int(part.FirstExtentIndex+part.NumExtents) > len(extents) {
+			return nil, fmt.Errorf("partition %s: invalid extent list (%d+%d > %d)",
+				name, part.FirstExtentIndex, part.NumExtents, len(extents))
 		}
-		if numExt == 0 {
+		if part.NumExtents == 0 {
 			continue
 		}
 
 		var pExts []LpMetadataExtent
 		var pSize uint64
-		for j := firstExt; j < firstExt+numExt; j++ {
+		for j := part.FirstExtentIndex; j < part.FirstExtentIndex+part.NumExtents; j++ {
 			e := extents[j]
 			if e.TargetType == LP_TARGET_TYPE_LINEAR {
 				pExts = append(pExts, e)
@@ -538,7 +514,7 @@ func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]Par
 			}
 		}
 
-		if attrs&LP_PARTITION_ATTR_SLOT_SUFFIXED != 0 {
+		if part.Attributes&LP_PARTITION_ATTR_SLOT_SUFFIXED != 0 {
 			name += "_a"
 		}
 
@@ -554,7 +530,7 @@ func (sp *SuperImage) readMetadataAt(g *LpMetadataGeometry, offset int64) ([]Par
 }
 
 func (sp *SuperImage) findMetadata(g *LpMetadataGeometry, geoOffset int64) ([]PartitionInfo, error) {
-	slot := uint32(0) // _a
+	slot := uint32(0)
 
 	off := primaryMetadataOffset(g, geoOffset, slot)
 	if sp.Verbose {
