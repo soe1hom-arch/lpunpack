@@ -14,8 +14,7 @@ import (
 const (
 	LpMetadataExtentTypeLinear = 0
 	SectorSize                 = 512
-	ScanMB                     = 256
-	ChunkSize                  = 256 * 1024
+	ChunkSize                  = 1024 * 1024 // 1MB chunks
 	MaxBuf                     = 64 * 1024 * 1024
 )
 
@@ -60,28 +59,22 @@ func OpenSuperImage(filename string, verbose bool) (*SuperImage, error) {
 
 func (sp *SuperImage) Close() error { return sp.file.Close() }
 
-type foundMagic struct {
-	offset int64
-	magic  string
-	err    string
-}
-
-func (sp *SuperImage) scanRange(start, size int64) []foundMagic {
-	var result []foundMagic
-	seen := make(map[int64]bool)
-
-	end := start + size
-	if end > sp.FileSize {
-		end = sp.FileSize
-	}
-	if start < 0 {
-		start = 0
+func (sp *SuperImage) parse() error {
+	var candidates []struct {
+		offset int64
+		magic  string
 	}
 
-	for off := start; off < end; off += ChunkSize {
+	// Scan ENTIRE file for LPMH and LPMP in 1MB chunks
+	if sp.Verbose {
+		fmt.Printf("Scanning %d bytes in %dKB chunks...\n", sp.FileSize, ChunkSize/1024)
+	}
+
+	for off := int64(0); off < sp.FileSize; off += ChunkSize {
 		readSize := int64(ChunkSize)
-		if off+readSize > end {
-			readSize = end - off
+		remaining := sp.FileSize - off
+		if remaining < readSize {
+			readSize = remaining
 		}
 		buf := make([]byte, readSize)
 		n, err := sp.file.ReadAt(buf, off)
@@ -90,50 +83,61 @@ func (sp *SuperImage) scanRange(start, size int64) []foundMagic {
 		}
 		data := buf[:n]
 
-		for _, magic := range [][]byte{{'L', 'P', 'M', 'H'}, {'L', 'P', 'M', 'P'}} {
+		for _, pattern := range [][]byte{{'L', 'P', 'M', 'H'}, {'L', 'P', 'M', 'P'}} {
 			idx := 0
 			for {
-				pos := bytes.Index(data[idx:], magic)
+				pos := bytes.Index(data[idx:], pattern)
 				if pos < 0 {
 					break
 				}
-				absOff := off + int64(idx+pos)
-				if !seen[absOff] {
-					result = append(result, foundMagic{offset: absOff, magic: string(magic)})
-					seen[absOff] = true
-				}
+				candidates = append(candidates, struct {
+					offset int64
+					magic  string
+				}{offset: off + int64(idx+pos), magic: string(pattern)})
 				idx += pos + 1
 			}
 		}
-	}
-	return result
-}
 
-func (sp *SuperImage) parse() error {
-	// Scan BOTH ends of the file for magic bytes
-	scanSize := int64(ScanMB * 1024 * 1024)
-	slots := sp.scanRange(0, scanSize)                       // start
-	slots = append(slots, sp.scanRange(sp.FileSize-scanSize, scanSize)...) // end
-
-	if len(slots) == 0 {
-		return fmt.Errorf("no LPMP/LPMH found (scanned first+last %dMB of %d byte file)", ScanMB, sp.FileSize)
+		if sp.Verbose && off%(100*ChunkSize) == 0 {
+			fmt.Printf("  scanned %d MB so far...\n", off/1024/1024)
+		}
 	}
 
 	if sp.Verbose {
-		fmt.Printf("Found %d magic signatures:\n", len(slots))
-		for _, s := range slots {
-			fmt.Printf("  %s at byte %d (0x%x)\n", s.magic, s.offset, s.offset)
+		fmt.Printf("Found %d magic signatures across entire file\n", len(candidates))
+		// Group by magic
+		lpmhCount := 0
+		lpmpCount := 0
+		for _, c := range candidates {
+			if c.magic == "LPMH" {
+				lpmhCount++
+			} else {
+				lpmpCount++
+			}
+		}
+		fmt.Printf("  LPMH: %d, LPMP: %d\n", lpmhCount, lpmpCount)
+		if lpmhCount > 0 {
+			fmt.Println("LPMH locations:")
+			for _, c := range candidates {
+				if c.magic == "LPMH" {
+					fmt.Printf("  offset %d (%.2f MB from start, %.2f MB from end)\n",
+						c.offset,
+						float64(c.offset)/1024/1024,
+						float64(sp.FileSize-c.offset)/1024/1024)
+				}
+			}
 		}
 	}
 
 	// Extract metadata_max_size from LPMP candidates
-	var bufSize int64 = 16 * 1024 * 1024 // 16MB default
-	for _, s := range slots {
-		if s.magic != "LPMP" {
+	var bufSize int64 = 16 * 1024 * 1024
+	lpmpValid := 0
+	for _, c := range candidates {
+		if c.magic != "LPMP" {
 			continue
 		}
 		buf := make([]byte, 52)
-		if _, err := sp.file.ReadAt(buf, s.offset); err != nil {
+		if _, err := sp.file.ReadAt(buf, c.offset); err != nil {
 			continue
 		}
 		ss := binary.LittleEndian.Uint32(buf[4:8])
@@ -142,20 +146,27 @@ func (sp *SuperImage) parse() error {
 		lbs := binary.LittleEndian.Uint32(buf[48:52])
 		if ss >= 12 && ss <= 4096 && mms >= 512 && mms <= MaxBuf && msc >= 1 && msc <= 32 {
 			bufSize = int64(mms)
+			lpmpValid++
 			if sp.Verbose {
-				fmt.Printf("  Using LPMP@%d: maxSize=%d slots=%d blockSize=%d\n", s.offset, mms, msc, lbs)
+				fmt.Printf("  Valid LPMP@%d: structSize=%d maxSize=%d slots=%d blockSize=%d\n",
+					c.offset, ss, mms, msc, lbs)
 			}
 		}
 	}
+	if sp.Verbose && lpmpValid > 0 {
+		fmt.Printf("Using bufSize=%d from LPMP\n", bufSize)
+	} else if sp.Verbose {
+		fmt.Println("No valid LPMP found, using default bufSize=16MB")
+	}
 
 	// Try to parse each LPMH
-	for _, s := range slots {
-		if s.magic != "LPMH" {
+	for _, c := range candidates {
+		if c.magic != "LPMH" {
 			continue
 		}
 
 		buf := make([]byte, bufSize)
-		n, err := sp.file.ReadAt(buf, s.offset)
+		n, err := sp.file.ReadAt(buf, c.offset)
 		if err != nil && err != io.EOF {
 			continue
 		}
@@ -170,8 +181,8 @@ func (sp *SuperImage) parse() error {
 		numExts := binary.LittleEndian.Uint32(buf[20:24])
 
 		if sp.Verbose {
-			fmt.Printf("  Trying LPMH@%d: v%d.%d hdrSize=%d parts=%d exts=%d\n",
-				s.offset, major, minor, hdrSz, numParts, numExts)
+			fmt.Printf("  LPMH@%d: v%d.%d hdrSize=%d parts=%d exts=%d\n",
+				c.offset, major, minor, hdrSz, numParts, numExts)
 		}
 
 		if major != 10 && major != 0 {
@@ -192,17 +203,13 @@ func (sp *SuperImage) parse() error {
 			continue
 		}
 
-		// Validate structure before parsing
 		extOff := hs
 		for i := uint32(0); i < numParts; i++ {
 			if int(extOff+4) > n {
-				return fmt.Errorf("LPMH@%d: part %d truncated at buf offset %d", s.offset, i, extOff)
+				return fmt.Errorf("part %d truncated at %d", i, extOff)
 			}
 			ns := binary.LittleEndian.Uint32(buf[extOff : extOff+4])
-			if ns > 256 { // sanity check on name size
-				if sp.Verbose {
-					fmt.Printf("    skip: part %d nameSize=%d too large\n", i, ns)
-				}
+			if ns > 256 {
 				extOff = -1
 				break
 			}
@@ -214,13 +221,9 @@ func (sp *SuperImage) parse() error {
 
 		needExt := extOff + 32*int64(numExts)
 		if int(needExt) > n {
-			if sp.Verbose {
-				fmt.Printf("    skip: extents need %d bytes but buffer is %d\n", needExt, n)
-			}
 			continue
 		}
 
-		// Parse extents
 		extents := make([]LpMetadataExtent, numExts)
 		for i := uint32(0); i < numExts; i++ {
 			es := extOff + int64(i)*32
@@ -230,11 +233,7 @@ func (sp *SuperImage) parse() error {
 				PartitionSector: binary.LittleEndian.Uint64(buf[es+16 : es+24]),
 				Type:            binary.LittleEndian.Uint64(buf[es+24 : es+32]),
 			}
-			// Validate extent
 			if extents[i].NumSectors == 0 && extents[i].Type == LpMetadataExtentTypeLinear {
-				if sp.Verbose {
-					fmt.Printf("    skip: extent %d has 0 sectors\n", i)
-				}
 				extOff = -1
 				break
 			}
@@ -243,7 +242,6 @@ func (sp *SuperImage) parse() error {
 			continue
 		}
 
-		// Parse partitions
 		sp.Partitions = nil
 		partOff := hs
 		for i := uint32(0); i < numParts; i++ {
@@ -285,16 +283,13 @@ func (sp *SuperImage) parse() error {
 
 		if len(sp.Partitions) > 0 {
 			if sp.Verbose {
-				fmt.Printf("  ✅ Success! Got %d partitions\n", len(sp.Partitions))
-				for _, p := range sp.Partitions {
-					fmt.Printf("     %s (%s)\n", p.Name, formatSize(int64(p.Size)))
-				}
+				fmt.Printf("  ✅ %d partitions found!\n", len(sp.Partitions))
 			}
 			return nil
 		}
 	}
 
-	return fmt.Errorf("no valid partition table found (%d magic hits in first+last %dMB)", len(slots), ScanMB)
+	return fmt.Errorf("no valid partition table found (scanned entire %d byte file, %d magic hits)", sp.FileSize, len(candidates))
 }
 
 func formatSize(b int64) string {
