@@ -82,6 +82,11 @@ Pre-built binaries for Linux, macOS, and Windows (amd64 + arm64) are available o
   partition (e.g., `system_a.img`, `vendor_a.img`).
 - **Supported metadata**: V10.x (all minor versions). Slot 0 (`_a`) is used by default.
 
+## Credits
+
+- **soe1hom-arch** — Go implementation and maintenance
+- [AOSP liblp](https://android.googlesource.com/platform/system/core/+/refs/heads/main/fs_mgr/liblp/) — Logical partition metadata format specification
+
 ## License
 
 Apache License 2.0
