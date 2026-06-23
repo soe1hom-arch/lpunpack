@@ -142,6 +142,8 @@ The tool follows the AOSP liblp on-disk format:
 ## Credits
 
 - **soe1hom-arch** — Go implementation and maintenance
+- This project is a Go port of the `lpunpack` utility from the
+  [Android Open Source Project (AOSP)](https://android.googlesource.com/platform/system/core/+/refs/heads/main/fs_mgr/liblp/).
 - [AOSP liblp](https://android.googlesource.com/platform/system/core/+/refs/heads/main/fs_mgr/liblp/) — Logical partition metadata format specification
 
 ## License
